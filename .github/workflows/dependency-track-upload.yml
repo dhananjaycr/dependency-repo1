@@ -6,144 +6,148 @@ on:
 env:
   DT_URL: https://dependabot.coinroutes.com:8081
   PROJECT_NAME: ${{ github.repository }}
-  PROJECT_VERSION: ${{ github.run_number }}
+  PROJECT_VERSION: ${{ github.run_id }}-${{ github.run_number }}-$(date +'%Y%m%d')
 
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl git wget apt-transport-https gnupg lsb-release
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update && sudo apt-get install -y trivy
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
 
       - name: Checkout repository
         run: |
-          git clone --depth 1 --branch ${{ github.ref_name }} https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
+          git clone --depth 1 https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
           echo "Repository structure:"
-          find . -type f -name "package.json" -o -name "requirements.txt" -o -name "Cargo.toml" -o -name "go.mod" -o -name "pom.xml" | head -20
+          find . -type f -name "*.json" -o -name "requirements.txt" -o -name "go.mod" | head -20
 
-      - name: Generate SBOM with Trivy
+      # --- SBOM Generation ---
+      - name: Generate SBOM (CycloneDX)
         run: |
-          trivy fs --format cyclonedx --output sbom.json . --scanners license,config
-          echo "SBOM generated. Components found:"
-          jq '.components | length' sbom.json 2>/dev/null || echo "0"
+          trivy fs \
+            --format cyclonedx \
+            --output sbom.json \
+            --scanners vuln,license,misconfig,secret \
+            --ignore-unfixed \
+            --include-os-pkgs \
+            --include-dev-deps \
+            .
 
+          echo "SBOM components count:"
+          jq '.components | length' sbom.json || echo 0
+
+      # --- Vulnerability Scan Output ---
       - name: Scan vulnerabilities with Trivy
         id: trivy
         run: |
           trivy fs --format json --severity CRITICAL,HIGH,MEDIUM,LOW . --scanners vuln > vulns.json
           
-          echo "Scanning results:"
-          jq '.Results[] | {Type: .Type, Target: .Target, Vulnerabilities: (.Vulnerabilities | length)}' vulns.json 2>/dev/null || echo "No results"
+          echo "Scanning results summary:"
+          jq '.Results[] | {Target: .Target, VulnCount: (.Vulnerabilities | length)}' vulns.json || true
           
-          count_vulns() {
-            local severity=$1
-            jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$severity\")] | length" vulns.json 2>/dev/null || echo 0
-          }
-          
-          CRITICAL=$(count_vulns CRITICAL)
-          HIGH=$(count_vulns HIGH)
-          MEDIUM=$(count_vulns MEDIUM)
-          LOW=$(count_vulns LOW)
-          TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))
-          
-          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
-          echo "high=$HIGH" >> $GITHUB_OUTPUT
-          echo "medium=$MEDIUM" >> $GITHUB_OUTPUT
-          echo "low=$LOW" >> $GITHUB_OUTPUT
+          for sev in CRITICAL HIGH MEDIUM LOW; do
+            COUNT=$(jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$sev\")] | length" vulns.json 2>/dev/null)
+            echo "${sev,,}=$COUNT" >> $GITHUB_OUTPUT
+          done
+
+          TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' vulns.json 2>/dev/null)
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
-      - name: Check and create/update Dependency-Track project
+      # --- CREATE or LOOKUP PROJECT ---
+      - name: Check / Create Dependency-Track Project
         id: project
         run: |
-          echo "Checking if project exists..."
-          EXISTING_UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
-            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" | jq -r '.uuid // empty')
-          
-          if [ -n "$EXISTING_UUID" ] && [ "$EXISTING_UUID" != "null" ]; then
-            echo "✅ Project exists: $EXISTING_UUID"
-            PROJECT_UUID=$EXISTING_UUID
-          else
-            echo "Creating new project..."
-            PROJECT_UUID=$(curl -s -X PUT "${{ env.DT_URL }}/api/v1/project" \
+          echo "Checking if project exists: ${{ env.PROJECT_NAME }} version ${{ env.PROJECT_VERSION }}"
+
+          LOOKUP_URL="${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}"
+
+          PROJECT_UUID=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" "$LOOKUP_URL" | jq -r '.uuid // empty')
+
+          if [ -z "$PROJECT_UUID" ]; then
+            echo "Project not found. Creating..."
+            CREATE_BODY=$(jq -n \
+              --arg name "${{ env.PROJECT_NAME }}" \
+              --arg version "${{ env.PROJECT_VERSION }}" \
+              '{name: $name, version: $version}')
+
+            PROJECT_UUID=$(curl -s \
               -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
               -H "Content-Type: application/json" \
-              -d "{\"name\":\"${{ env.PROJECT_NAME }}\",\"version\":\"${{ env.PROJECT_VERSION }}\"}" | jq -r '.uuid // empty')
-            
-            if [ -z "$PROJECT_UUID" ] || [ "$PROJECT_UUID" == "null" ]; then
-              echo "⚠️  Project creation failed, trying lookup again..."
-              PROJECT_UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
-                -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" | jq -r '.uuid')
-            else
-              echo "✅ Project created: $PROJECT_UUID"
-            fi
-          fi
-          
-          echo "uuid=$PROJECT_UUID" >> $GITHUB_OUTPUT
-          echo "Project UUID: $PROJECT_UUID"
+              -X PUT "${{ env.DT_URL }}/api/v1/project" \
+              -d "$CREATE_BODY" | jq -r '.uuid // empty')
 
+            if [ -z "$PROJECT_UUID" ]; then
+              echo "Failed to create project"
+              exit 1
+            fi
+
+            echo "Created project UUID: $PROJECT_UUID"
+          else
+            echo "Project exists: $PROJECT_UUID"
+          fi
+
+          echo "uuid=$PROJECT_UUID" >> $GITHUB_OUTPUT
+
+      # --- UPLOAD SBOM ---
       - name: Upload SBOM to Dependency-Track
         run: |
-          if [ -f "sbom.json" ] && [ -s "sbom.json" ]; then
-            COMPONENTS=$(jq '.components | length' sbom.json 2>/dev/null || echo "0")
-            echo "Uploading SBOM with $COMPONENTS components..."
-            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${{ env.DT_URL }}/api/v1/bom" \
-              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-              -F "project=${{ steps.project.outputs.uuid }}" \
-              -F "bom=@sbom.json")
-            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
-              echo "✅ SBOM uploaded successfully (HTTP $HTTP_CODE)"
-            else
-              echo "⚠️  Upload response: $RESPONSE"
-            fi
-          else
-            echo "⚠️  No SBOM file found or file is empty"
+          if [ ! -s sbom.json ]; then
+            echo "SBOM missing or empty. Cannot upload."
+            exit 1
+          fi
+          
+          echo "Uploading SBOM..."
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            -X POST "${{ env.DT_URL }}/api/v1/bom" \
+            -F "project=${{ steps.project.outputs.uuid }}" \
+            -F "bom=@sbom.json")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "SBOM upload failed: $RESPONSE"
+            exit 1
           fi
 
+          echo "SBOM upload ok (HTTP $HTTP_CODE)"
+
+      # --- METRICS ---
       - name: Get Dependency-Track metrics
         id: dt
         run: |
-          echo "Waiting for Dependency-Track analysis..."
-          sleep 30
-          for i in {1..15}; do
-            METRICS=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/metrics/project/${{ steps.project.outputs.uuid }}/current" \
-              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}")
-            LAST_OCCURRENCE=$(echo $METRICS | jq -r '.lastOccurrence // empty' 2>/dev/null)
-            if [ -n "$LAST_OCCURRENCE" ] && [ "$LAST_OCCURRENCE" != "null" ]; then
-              echo "✅ Analysis complete"
-              break
-            fi
-            echo "Waiting for analysis... ($i/15)"
-            [ $i -lt 15 ] && sleep 10
-          done
-          
-          echo "critical=$(echo $METRICS | jq -r '.critical // 0')" >> $GITHUB_OUTPUT
-          echo "high=$(echo $METRICS | jq -r '.high // 0')" >> $GITHUB_OUTPUT
-          echo "medium=$(echo $METRICS | jq -r '.medium // 0')" >> $GITHUB_OUTPUT
-          echo "low=$(echo $METRICS | jq -r '.low // 0')" >> $GITHUB_OUTPUT
-          echo "total=$(echo $METRICS | jq -r '.vulnerabilities // 0')" >> $GITHUB_OUTPUT
+          UUID=${{ steps.project.outputs.uuid }}
 
+          echo "Waiting for analysis..."
+          sleep 25
+
+          METRICS=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            "${{ env.DT_URL }}/api/v1/metrics/project/$UUID/current")
+
+          for sev in critical high medium low; do
+            VAL=$(echo "$METRICS" | jq -r ".${sev} // 0")
+            echo "${sev}=$VAL" >> $GITHUB_OUTPUT
+          done
+
+          TOTAL=$(echo "$METRICS" | jq -r '.vulnerabilities // 0')
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
+
+      # --- SUMMARY ---
       - name: Display results
         run: |
-          printf "\n==========================================\n"
-          printf "📊 VULNERABILITY SCAN COMPARISON\n"
-          printf "==========================================\n\n"
-          printf "Project: ${{ env.PROJECT_NAME }}\n"
-          printf "Version: ${{ env.PROJECT_VERSION }}\n\n"
-          printf "┌──────────────┬──────────────────┬──────────┐\n"
-          printf "│ Severity     │ Dependency-Track │ Trivy    │\n"
-          printf "├──────────────┼──────────────────┼──────────┤\n"
-          printf "│ 🔴 Critical  │ %16s │ %8s │\n" "${{ steps.dt.outputs.critical }}" "${{ steps.trivy.outputs.critical }}"
-          printf "│ 🟠 High       │ %16s │ %8s │\n" "${{ steps.dt.outputs.high }}" "${{ steps.trivy.outputs.high }}"
-          printf "│ 🟡 Medium     │ %16s │ %8s │\n" "${{ steps.dt.outputs.medium }}" "${{ steps.trivy.outputs.medium }}"
-          printf "│ 🟢 Low        │ %16s │ %8s │\n" "${{ steps.dt.outputs.low }}" "${{ steps.trivy.outputs.low }}"
-          printf "├──────────────┼──────────────────┼──────────┤\n"
-          printf "│ 📈 Total      │ %16s │ %8s │\n" "${{ steps.dt.outputs.total }}" "${{ steps.trivy.outputs.total }}"
-          printf "└──────────────┴──────────────────┴──────────┘\n"
-          printf "==========================================\n"
+          echo ""
+          echo "=========================================="
+          echo "  Vulnerability Comparison"
+          echo "=========================================="
+          printf "Critical: DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.critical }}" "${{ steps.trivy.outputs.critical }}"
+          printf "High:     DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.high }}" "${{ steps.trivy.outputs.high }}"
+          printf "Medium:   DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.medium }}" "${{ steps.trivy.outputs.medium }}"
+          printf "Low:      DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.low }}" "${{ steps.trivy.outputs.low }}"
+          echo "=========================================="
