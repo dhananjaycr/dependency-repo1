@@ -69,13 +69,13 @@ jobs:
           echo "Uploading SBOM with projectName=$PROJECT_NAME, version=$PROJECT_VERSION"
           
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
-            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            -H "X-Api-Key:${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
             -X POST "${{ env.DT_URL }}/api/v1/bom" \
             -F "projectName=$PROJECT_NAME" \
             -F "projectVersion=$PROJECT_VERSION" \
             -F "bom=@sbom.json" \
             -F "autoCreate=true")
-
+          
           HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE" | cut -d: -f2)
           
           if [ "$HTTP_CODE" = "200" ]; then
@@ -89,7 +89,7 @@ jobs:
           
           # Get project UUID for metrics
           sleep 2
-          PROJECT_UUID=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+          PROJECT_UUID=$(curl -s -H "X-Api-Key:${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
             "${{ env.DT_URL }}/api/v1/project/lookup?name=$PROJECT_NAME&version=$PROJECT_VERSION" | jq -r '.uuid // empty')
           
           if [ -z "$PROJECT_UUID" ]; then
@@ -118,7 +118,7 @@ jobs:
 
           sleep 25
 
-          METRICS=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+          METRICS=$(curl -s -H "X-Api-Key:${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
             "${{ env.DT_URL }}/api/v1/metrics/project/$UUID/current")
 
           for sev in critical high medium low; do
