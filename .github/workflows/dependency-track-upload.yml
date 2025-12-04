@@ -10,6 +10,8 @@ env:
 jobs:
   generate-and-upload:
     runs-on: ubuntu-latest
+    env:
+      DT_API_KEY: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}
 
     steps:
       - name: Install tools
@@ -65,8 +67,6 @@ jobs:
       - name: Upload SBOM to Dependency-Track
         id: upload
         run: |
-          set -e
-          
           PROJECT_VERSION=$(date +%Y%m%d)
           PROJECT_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
           
@@ -87,17 +87,30 @@ jobs:
           echo "Step 2: Uploading SBOM..."
           echo "  Project: $PROJECT_NAME"
           echo "  Version: $PROJECT_VERSION"
+          echo "  URL: $DT_URL/api/v1/bom"
           
-          RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
-            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            -X POST "${{ env.DT_URL }}/api/v1/bom" \
+          RESPONSE=$(curl --max-time 120 --connect-timeout 30 -s -w "\nHTTP_CODE:%{http_code}" \
+            -H "X-Api-Key: $DT_API_KEY" \
+            -X POST "$DT_URL/api/v1/bom" \
             -F "projectName=$PROJECT_NAME" \
             -F "projectVersion=$PROJECT_VERSION" \
             -F "bom=@sbom.json" \
-            -F "autoCreate=true")
+            -F "autoCreate=true" 2>&1)
+          
+          if [ $? -ne 0 ]; then
+            echo "ERROR: Curl command failed"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
           
           HTTP_CODE=$(echo "$RESPONSE" | grep "HTTP_CODE" | cut -d: -f2 || echo "")
           BODY=$(echo "$RESPONSE" | grep -v "HTTP_CODE" || echo "")
+          
+          if [ -z "$HTTP_CODE" ]; then
+            echo "ERROR: No HTTP code received"
+            echo "Response: $RESPONSE"
+            exit 1
+          fi
           
           if [ "$HTTP_CODE" != "200" ]; then
             echo "ERROR: Upload failed"
@@ -113,8 +126,8 @@ jobs:
           echo "Step 3: Getting project UUID..."
           sleep 2
           
-          PROJECT_UUID=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            "${{ env.DT_URL }}/api/v1/project/lookup?name=$PROJECT_NAME&version=$PROJECT_VERSION" | jq -r '.uuid // empty' 2>/dev/null || echo "")
+          PROJECT_UUID=$(curl --max-time 30 -s -H "X-Api-Key: $DT_API_KEY" \
+            "$DT_URL/api/v1/project/lookup?name=$PROJECT_NAME&version=$PROJECT_VERSION" | jq -r '.uuid // empty' 2>/dev/null || echo "")
           
           if [ -z "$PROJECT_UUID" ] || [ "$PROJECT_UUID" = "null" ]; then
             echo "WARNING: Could not get project UUID"
@@ -146,8 +159,8 @@ jobs:
           sleep 25
 
           echo "Step 5: Fetching metrics..."
-          METRICS=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            "${{ env.DT_URL }}/api/v1/metrics/project/$UUID/current")
+          METRICS=$(curl --max-time 30 -s -H "X-Api-Key: $DT_API_KEY" \
+            "$DT_URL/api/v1/metrics/project/$UUID/current")
 
           if [ -z "$METRICS" ]; then
             echo "WARNING: No metrics returned"
