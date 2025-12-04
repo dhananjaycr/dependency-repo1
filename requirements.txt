@@ -12,7 +12,7 @@ fastapi_sessions==0.3.2
 starlette==0.19.1
 aiofiles==0.7.0
 uvicorn==0.14.0
-Jinja2==3.1.2
+Jinja2==3.1.6
 requests==2.26.0
 slowapi==0.1.8
 networkx==2.6.2
