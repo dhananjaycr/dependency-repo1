@@ -88,8 +88,20 @@ jobs:
           echo "  Project: $PROJECT_NAME"
           echo "  Version: $PROJECT_VERSION"
           echo "  URL: $DT_URL/api/v1/bom"
+          echo "  SBOM file: $(ls -lh sbom.json | awk '{print $5}')"
+          echo ""
           
-          RESPONSE=$(curl --max-time 120 --connect-timeout 30 -s -w "\nHTTP_CODE:%{http_code}" \
+          echo "Testing connection..."
+          if ! curl --max-time 10 --connect-timeout 5 -s -o /dev/null -w "%{http_code}" "$DT_URL/api/v1/version" > /dev/null 2>&1; then
+            echo "WARNING: Could not reach Dependency-Track server"
+          else
+            echo "✅ Server is reachable"
+          fi
+          
+          echo "Starting upload (this may take a moment for large files)..."
+          
+          RESPONSE=$(curl --max-time 180 --connect-timeout 30 --show-error \
+            -w "\nHTTP_CODE:%{http_code}\nTIME_TOTAL:%{time_total}s" \
             -H "X-Api-Key: $DT_API_KEY" \
             -X POST "$DT_URL/api/v1/bom" \
             -F "projectName=$PROJECT_NAME" \
@@ -97,9 +109,15 @@ jobs:
             -F "bom=@sbom.json" \
             -F "autoCreate=true" 2>&1)
           
-          if [ $? -ne 0 ]; then
-            echo "ERROR: Curl command failed"
-            echo "Response: $RESPONSE"
+          CURL_EXIT=$?
+          echo ""
+          echo "Upload completed. Exit code: $CURL_EXIT"
+          
+          if [ $CURL_EXIT -ne 0 ]; then
+            echo "ERROR: Curl failed (exit code $CURL_EXIT)"
+            echo "Exit code 28 = timeout"
+            echo "Full response:"
+            echo "$RESPONSE"
             exit 1
           fi
           
