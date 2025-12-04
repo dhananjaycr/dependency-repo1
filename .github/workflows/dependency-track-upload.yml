@@ -26,9 +26,8 @@ jobs:
         run: |
           git clone --depth 1 https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
           echo "Repository structure:"
-          find . -type f -name "*.json" -o -name "requirements.txt" -o -name "go.mod" | head -20
+          find . -type f -name "package.json" -o -name "requirements.txt" | head -20
 
-      # --- SBOM Generation ---
       - name: Generate SBOM (CycloneDX)
         run: |
           trivy fs \
@@ -36,43 +35,38 @@ jobs:
             --output sbom.json \
             --scanners vuln,license,misconfig,secret \
             --ignore-unfixed \
-            --include-os-pkgs \
-            --include-dev-deps \
             .
 
           echo "SBOM components count:"
           jq '.components | length' sbom.json || echo 0
 
-      # --- Vulnerability Scan Output ---
       - name: Scan vulnerabilities with Trivy
         id: trivy
         run: |
           trivy fs --format json --severity CRITICAL,HIGH,MEDIUM,LOW . --scanners vuln > vulns.json
-          
-          echo "Scanning results summary:"
-          jq '.Results[] | {Target: .Target, VulnCount: (.Vulnerabilities | length)}' vulns.json || true
+
+          echo "Scan summary:"
+          jq '.Results[] | {Target: .Target, Count: (.Vulnerabilities | length)}' vulns.json || true
           
           for sev in CRITICAL HIGH MEDIUM LOW; do
-            COUNT=$(jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$sev\")] | length" vulns.json 2>/dev/null)
+            COUNT=$(jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$sev\")] | length" vulns.json)
             echo "${sev,,}=$COUNT" >> $GITHUB_OUTPUT
           done
 
-          TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' vulns.json 2>/dev/null)
+          TOTAL=$(jq '[.Results[]?.Vulnerabilities[]?] | length' vulns.json)
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
-      # --- CREATE or LOOKUP PROJECT ---
       - name: Check / Create Dependency-Track Project
         id: project
         run: |
-          echo "Checking if project exists: ${{ env.PROJECT_NAME }} version ${{ env.PROJECT_VERSION }}"
-
           LOOKUP_URL="${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}"
 
           PROJECT_UUID=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" "$LOOKUP_URL" | jq -r '.uuid // empty')
 
           if [ -z "$PROJECT_UUID" ]; then
-            echo "Project not found. Creating..."
-            CREATE_BODY=$(jq -n \
+            echo "Project not found → creating"
+
+            BODY=$(jq -n \
               --arg name "${{ env.PROJECT_NAME }}" \
               --arg version "${{ env.PROJECT_VERSION }}" \
               '{name: $name, version: $version}')
@@ -81,51 +75,47 @@ jobs:
               -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
               -H "Content-Type: application/json" \
               -X PUT "${{ env.DT_URL }}/api/v1/project" \
-              -d "$CREATE_BODY" | jq -r '.uuid // empty')
+              -d "$BODY" | jq -r '.uuid // empty')
 
             if [ -z "$PROJECT_UUID" ]; then
-              echo "Failed to create project"
+              echo "Project creation failed"
               exit 1
             fi
-
-            echo "Created project UUID: $PROJECT_UUID"
           else
             echo "Project exists: $PROJECT_UUID"
           fi
 
           echo "uuid=$PROJECT_UUID" >> $GITHUB_OUTPUT
 
-      # --- UPLOAD SBOM ---
-      - name: Upload SBOM to Dependency-Track
+      - name: Upload SBOM
         run: |
+          UUID=${{ steps.project.outputs.uuid }}
+
           if [ ! -s sbom.json ]; then
-            echo "SBOM missing or empty. Cannot upload."
+            echo "SBOM missing or empty"
             exit 1
           fi
-          
-          echo "Uploading SBOM..."
+
           RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
             -X POST "${{ env.DT_URL }}/api/v1/bom" \
-            -F "project=${{ steps.project.outputs.uuid }}" \
+            -F "project=$UUID" \
             -F "bom=@sbom.json")
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          CODE=$(echo "$RESPONSE" | tail -n1)
 
-          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-            echo "SBOM upload failed: $RESPONSE"
+          if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
+            echo "SBOM upload OK ($CODE)"
+          else
+            echo "Upload failed: $RESPONSE"
             exit 1
           fi
 
-          echo "SBOM upload ok (HTTP $HTTP_CODE)"
-
-      # --- METRICS ---
-      - name: Get Dependency-Track metrics
+      - name: Get Dependency-Track Metrics
         id: dt
         run: |
           UUID=${{ steps.project.outputs.uuid }}
 
-          echo "Waiting for analysis..."
           sleep 25
 
           METRICS=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
@@ -133,21 +123,13 @@ jobs:
 
           for sev in critical high medium low; do
             VAL=$(echo "$METRICS" | jq -r ".${sev} // 0")
-            echo "${sev}=$VAL" >> $GITHUB_OUTPUT
+            echo "$sev=$VAL" >> $GITHUB_OUTPUT
           done
 
           TOTAL=$(echo "$METRICS" | jq -r '.vulnerabilities // 0')
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
-      # --- SUMMARY ---
-      - name: Display results
+      - name: Summary
         run: |
-          echo ""
-          echo "=========================================="
-          echo "  Vulnerability Comparison"
-          echo "=========================================="
+          echo "Compare:"
           printf "Critical: DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.critical }}" "${{ steps.trivy.outputs.critical }}"
-          printf "High:     DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.high }}" "${{ steps.trivy.outputs.high }}"
-          printf "Medium:   DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.medium }}" "${{ steps.trivy.outputs.medium }}"
-          printf "Low:      DT=%s  Trivy=%s\n" "${{ steps.dt.outputs.low }}" "${{ steps.trivy.outputs.low }}"
-          echo "=========================================="
