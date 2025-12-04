@@ -29,14 +29,29 @@ jobs:
         run: |
           git clone --depth 1 --branch ${{ github.ref_name }} https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
 
+      - name: Install dependencies
+        run: |
+          if [ -f "app/package.json" ]; then
+            cd app && npm install --no-audit --no-fund --package-lock-only && cd ..
+          elif [ -f "package.json" ]; then
+            npm install --no-audit --no-fund --package-lock-only
+          fi
+
       - name: Generate SBOMs
         run: |
-          [ -f "app/package.json" ] && cd app && cyclonedx-npm --output-file ../sbom-nodejs.json && cd .. || \
-          [ -f "package.json" ] && cyclonedx-npm --output-file sbom-nodejs.json || \
-          echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-nodejs.json
+          if [ -f "app/package.json" ]; then
+            cd app && cyclonedx-npm --output-file ../sbom-nodejs.json && cd ..
+          elif [ -f "package.json" ]; then
+            cyclonedx-npm --output-file sbom-nodejs.json
+          else
+            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-nodejs.json
+          fi
           
-          [ -f "requirements.txt" ] && cyclonedx-bom -o sbom-python.json -r requirements.txt || \
-          echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-python.json
+          if [ -f "requirements.txt" ]; then
+            cyclonedx-bom -o sbom-python.json -r requirements.txt
+          else
+            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-python.json
+          fi
 
       - name: Upload SBOMs
         run: |
