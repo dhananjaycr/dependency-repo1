@@ -5,7 +5,7 @@ on:
 
 env:
   DT_URL: https://dependabot.coinroutes.com:8081
-  PROJECT_NAME: clarity-test
+  PROJECT_NAME: ${{ github.repository }}
   PROJECT_VERSION: ${{ github.run_number }}
 
 jobs:
@@ -13,12 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
+      - name: Verify workspace
         run: |
-          if [ ! -f "app/package.json" ]; then
-            git clone --depth 1 https://github.com/${{ github.repository }}.git .
-            git checkout ${{ github.ref_name }}
-          fi
+          pwd
+          ls -la
+          echo "Repository: ${{ github.repository }}"
 
       - name: Install tools
         run: |
@@ -45,8 +44,27 @@ jobs:
 
       - name: Generate SBOMs
         run: |
-          cd app && cyclonedx-npm --output-file ../sbom-nodejs.json
-          cd .. && cyclonedx-bom -o sbom-python.json -r requirements.txt
+          if [ -f "app/package.json" ] || [ -f "package.json" ]; then
+            if [ -f "app/package.json" ]; then
+              cd app && cyclonedx-npm --output-file ../sbom-nodejs.json && cd ..
+            else
+              cyclonedx-npm --output-file sbom-nodejs.json
+            fi
+            echo "✅ Node.js SBOM generated"
+          else
+            echo "⚠️  No package.json found, skipping Node.js SBOM"
+            touch sbom-nodejs.json
+            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-nodejs.json
+          fi
+          
+          if [ -f "requirements.txt" ]; then
+            cyclonedx-bom -o sbom-python.json -r requirements.txt
+            echo "✅ Python SBOM generated"
+          else
+            echo "⚠️  No requirements.txt found, skipping Python SBOM"
+            touch sbom-python.json
+            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-python.json
+          fi
 
       - name: Install Trivy
         run: |
@@ -58,39 +76,56 @@ jobs:
 
       - name: Upload SBOMs to Dependency-Track
         run: |
-          curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
-            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            -H "Content-Type: multipart/form-data" \
-            -F "projectName=${{ env.PROJECT_NAME }}" \
-            -F "projectVersion=${{ env.PROJECT_VERSION }}" \
-            -F "bom=@sbom-nodejs.json" \
-            -F "autoCreate=true"
+          if [ -f "sbom-nodejs.json" ] && [ -s "sbom-nodejs.json" ] && [ "$(jq -r '.components | length' sbom-nodejs.json 2>/dev/null || echo 0)" != "0" ]; then
+            echo "Uploading Node.js SBOM..."
+            curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
+              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+              -H "Content-Type: multipart/form-data" \
+              -F "projectName=${{ env.PROJECT_NAME }}" \
+              -F "projectVersion=${{ env.PROJECT_VERSION }}" \
+              -F "bom=@sbom-nodejs.json" \
+              -F "autoCreate=true"
+          fi
           
-          curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
-            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            -H "Content-Type: multipart/form-data" \
-            -F "projectName=${{ env.PROJECT_NAME }}" \
-            -F "projectVersion=${{ env.PROJECT_VERSION }}" \
-            -F "bom=@sbom-python.json" \
-            -F "autoCreate=true"
+          if [ -f "sbom-python.json" ] && [ -s "sbom-python.json" ] && [ "$(jq -r '.components | length' sbom-python.json 2>/dev/null || echo 0)" != "0" ]; then
+            echo "Uploading Python SBOM..."
+            curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
+              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+              -H "Content-Type: multipart/form-data" \
+              -F "projectName=${{ env.PROJECT_NAME }}" \
+              -F "projectVersion=${{ env.PROJECT_VERSION }}" \
+              -F "bom=@sbom-python.json" \
+              -F "autoCreate=true"
+          fi
 
       - name: Scan SBOMs with Trivy
         id: trivy_scan
         run: |
           echo "Scanning SBOMs with Trivy..."
-          trivy sbom --format json --output trivy-nodejs.json sbom-nodejs.json
-          trivy sbom --format json --output trivy-python.json sbom-python.json
+          NODE_CRITICAL=0
+          NODE_HIGH=0
+          NODE_MEDIUM=0
+          NODE_LOW=0
+          PYTHON_CRITICAL=0
+          PYTHON_HIGH=0
+          PYTHON_MEDIUM=0
+          PYTHON_LOW=0
           
-          # Parse Trivy results
-          NODE_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-nodejs.json || echo "0")
-          NODE_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-nodejs.json || echo "0")
-          NODE_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-nodejs.json || echo "0")
-          NODE_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-nodejs.json || echo "0")
+          if [ -f "sbom-nodejs.json" ] && [ -s "sbom-nodejs.json" ] && [ "$(jq -r '.components | length' sbom-nodejs.json 2>/dev/null || echo 0)" != "0" ]; then
+            trivy sbom --format json --output trivy-nodejs.json sbom-nodejs.json
+            NODE_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
+            NODE_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
+            NODE_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
+            NODE_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
+          fi
           
-          PYTHON_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-python.json || echo "0")
-          PYTHON_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-python.json || echo "0")
-          PYTHON_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-python.json || echo "0")
-          PYTHON_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-python.json || echo "0")
+          if [ -f "sbom-python.json" ] && [ -s "sbom-python.json" ] && [ "$(jq -r '.components | length' sbom-python.json 2>/dev/null || echo 0)" != "0" ]; then
+            trivy sbom --format json --output trivy-python.json sbom-python.json
+            PYTHON_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-python.json 2>/dev/null || echo "0")
+            PYTHON_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-python.json 2>/dev/null || echo "0")
+            PYTHON_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-python.json 2>/dev/null || echo "0")
+            PYTHON_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-python.json 2>/dev/null || echo "0")
+          fi
           
           TRIVY_CRITICAL=$((NODE_CRITICAL + PYTHON_CRITICAL))
           TRIVY_HIGH=$((NODE_HIGH + PYTHON_HIGH))
