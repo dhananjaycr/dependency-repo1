@@ -36,7 +36,7 @@ python-telegram-bot==13.11
 binance-connector==1.13.0
 python-binance==1.0.16
 pyquery==1.4.3
-gunicorn==20.1.0
+gunicorn==22.0.0
 duckdb==0.4.0
 fireblocks-sdk==1.19.0
 boto3==1.24.89
