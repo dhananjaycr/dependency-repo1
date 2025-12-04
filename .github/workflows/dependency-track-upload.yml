@@ -6,7 +6,6 @@ on:
 env:
   DT_URL: https://dependabot.coinroutes.com:8081
   PROJECT_NAME: ${{ github.repository }}
-  PROJECT_VERSION: ${{ github.run_id }}-${{ github.run_number }}-$(date +'%Y%m%d')
 
 jobs:
   generate-and-upload:
@@ -59,37 +58,34 @@ jobs:
       - name: Check / Create Dependency-Track Project
         id: project
         run: |
-          LOOKUP_URL="${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}"
-
-          PROJECT_UUID=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" "$LOOKUP_URL" | jq -r '.uuid // empty')
-
+          PROJECT_VERSION=$(date +%Y%m%d)
+          
+          # Search for project by name only
+          PROJECTS=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            "${{ env.DT_URL }}/api/v1/project?name=${{ env.PROJECT_NAME }}")
+          
+          PROJECT_UUID=$(echo "$PROJECTS" | jq -r ".[] | select(.name==\"${{ env.PROJECT_NAME }}\") | .uuid" | head -1)
+          
           if [ -z "$PROJECT_UUID" ]; then
-            echo "Project not found → creating"
-
-            BODY=$(jq -n \
-              --arg name "${{ env.PROJECT_NAME }}" \
-              --arg version "${{ env.PROJECT_VERSION }}" \
-              '{name: $name, version: $version}')
-
-            PROJECT_UUID=$(curl -s \
+            echo "Project not found - creating with version $PROJECT_VERSION"
+            PROJECT_UUID=$(curl -s -X PUT "${{ env.DT_URL }}/api/v1/project" \
               -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
               -H "Content-Type: application/json" \
-              -X PUT "${{ env.DT_URL }}/api/v1/project" \
-              -d "$BODY" | jq -r '.uuid // empty')
-
-            if [ -z "$PROJECT_UUID" ]; then
-              echo "Project creation failed"
-              exit 1
-            fi
+              -d "{\"name\":\"${{ env.PROJECT_NAME }}\",\"version\":\"$PROJECT_VERSION\"}" | jq -r '.uuid // empty')
+            
+            [ -z "$PROJECT_UUID" ] && echo "Creation failed" && exit 1
+            echo "Project created: $PROJECT_UUID"
           else
-            echo "Project exists: $PROJECT_UUID"
+            echo "Project exists: $PROJECT_UUID - uploading with version $PROJECT_VERSION"
           fi
-
+          
           echo "uuid=$PROJECT_UUID" >> $GITHUB_OUTPUT
+          echo "version=$PROJECT_VERSION" >> $GITHUB_OUTPUT
 
       - name: Upload SBOM
         run: |
           UUID=${{ steps.project.outputs.uuid }}
+          VERSION=${{ steps.project.outputs.version }}
 
           if [ ! -s sbom.json ]; then
             echo "SBOM missing or empty"
@@ -100,12 +96,13 @@ jobs:
             -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
             -X POST "${{ env.DT_URL }}/api/v1/bom" \
             -F "project=$UUID" \
+            -F "projectVersion=$VERSION" \
             -F "bom=@sbom.json")
 
           CODE=$(echo "$RESPONSE" | tail -n1)
 
           if [ "$CODE" = "200" ] || [ "$CODE" = "201" ]; then
-            echo "SBOM upload OK ($CODE)"
+            echo "SBOM uploaded successfully (HTTP $CODE)"
           else
             echo "Upload failed: $RESPONSE"
             exit 1
