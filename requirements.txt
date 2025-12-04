@@ -18,7 +18,7 @@ slowapi==0.1.8
 networkx==2.6.2
 black==22.3.0
 pydantic==1.10.7
-python-multipart==0.0.5
+python-multipart==0.0.18
 dill==0.3.4
 hypothesis==6.31.6
 pytest==6.2.5
