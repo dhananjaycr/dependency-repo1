@@ -13,16 +13,22 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Verify workspace
-        run: |
-          pwd
-          ls -la
-          echo "Repository: ${{ github.repository }}"
-
       - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl git
+
+      - name: Checkout code
+        run: |
+          git clone --depth 1 --branch ${{ github.ref_name }} https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
+          ls -la
+          echo "✅ Code checked out"
+          if [ -f "app/package.json" ]; then
+            echo "✅ Found app/package.json"
+          fi
+          if [ -f "requirements.txt" ]; then
+            echo "✅ Found requirements.txt"
+          fi
           
       - name: Setup Node.js
         run: |
