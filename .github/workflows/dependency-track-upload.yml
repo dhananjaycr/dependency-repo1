@@ -13,190 +13,111 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Install tools
+      - name: Setup environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq curl git
+          sudo apt-get install -y jq curl git wget apt-transport-https gnupg lsb-release python3 python3-pip
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          npm install -g @cyclonedx/cyclonedx-npm
+          python3 -m pip install cyclonedx-bom
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update && sudo apt-get install -y trivy
 
       - name: Checkout code
         run: |
           git clone --depth 1 --branch ${{ github.ref_name }} https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
-          ls -la
-          echo "✅ Code checked out"
-          if [ -f "app/package.json" ]; then
-            echo "✅ Found app/package.json"
-          fi
-          if [ -f "requirements.txt" ]; then
-            echo "✅ Found requirements.txt"
-          fi
-          
-      - name: Setup Node.js
-        run: |
-          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-          sudo apt-get install -y nodejs
-          node --version
-          npm --version
-
-      - name: Setup Python
-        run: |
-          sudo apt-get install -y python3 python3-pip python3-venv
-          python3 --version
-          python3 -m pip --version
-
-      - name: Install CycloneDX tools
-        run: |
-          npm install -g @cyclonedx/cyclonedx-npm
-          python3 -m pip install cyclonedx-bom
 
       - name: Generate SBOMs
         run: |
-          if [ -f "app/package.json" ] || [ -f "package.json" ]; then
-            if [ -f "app/package.json" ]; then
-              cd app && cyclonedx-npm --output-file ../sbom-nodejs.json && cd ..
-            else
-              cyclonedx-npm --output-file sbom-nodejs.json
-            fi
-            echo "✅ Node.js SBOM generated"
-          else
-            echo "⚠️  No package.json found, skipping Node.js SBOM"
-            touch sbom-nodejs.json
-            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-nodejs.json
-          fi
+          [ -f "app/package.json" ] && cd app && cyclonedx-npm --output-file ../sbom-nodejs.json && cd .. || \
+          [ -f "package.json" ] && cyclonedx-npm --output-file sbom-nodejs.json || \
+          echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-nodejs.json
           
-          if [ -f "requirements.txt" ]; then
-            cyclonedx-bom -o sbom-python.json -r requirements.txt
-            echo "✅ Python SBOM generated"
-          else
-            echo "⚠️  No requirements.txt found, skipping Python SBOM"
-            touch sbom-python.json
-            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-python.json
-          fi
+          [ -f "requirements.txt" ] && cyclonedx-bom -o sbom-python.json -r requirements.txt || \
+          echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-python.json
 
-      - name: Install Trivy
+      - name: Upload SBOMs
         run: |
-          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy
-
-      - name: Upload SBOMs to Dependency-Track
-        run: |
-          if [ -f "sbom-nodejs.json" ] && [ -s "sbom-nodejs.json" ] && [ "$(jq -r '.components | length' sbom-nodejs.json 2>/dev/null || echo 0)" != "0" ]; then
-            echo "Uploading Node.js SBOM..."
-            curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
+          upload_sbom() {
+            local file=$1
+            [ -f "$file" ] && [ -s "$file" ] && [ "$(jq -r '.components | length' "$file" 2>/dev/null || echo 0)" != "0" ] && \
+            curl -s -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
               -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
               -H "Content-Type: multipart/form-data" \
               -F "projectName=${{ env.PROJECT_NAME }}" \
               -F "projectVersion=${{ env.PROJECT_VERSION }}" \
-              -F "bom=@sbom-nodejs.json" \
-              -F "autoCreate=true"
-          fi
-          
-          if [ -f "sbom-python.json" ] && [ -s "sbom-python.json" ] && [ "$(jq -r '.components | length' sbom-python.json 2>/dev/null || echo 0)" != "0" ]; then
-            echo "Uploading Python SBOM..."
-            curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
-              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-              -H "Content-Type: multipart/form-data" \
-              -F "projectName=${{ env.PROJECT_NAME }}" \
-              -F "projectVersion=${{ env.PROJECT_VERSION }}" \
-              -F "bom=@sbom-python.json" \
-              -F "autoCreate=true"
-          fi
+              -F "bom=@$file" \
+              -F "autoCreate=true" > /dev/null && echo "✅ Uploaded $(basename $file)" || echo "⚠️  Skipped $(basename $file)"
+          }
+          upload_sbom sbom-nodejs.json
+          upload_sbom sbom-python.json
 
-      - name: Scan SBOMs with Trivy
-        id: trivy_scan
+      - name: Scan with Trivy
+        id: trivy
         run: |
-          echo "Scanning SBOMs with Trivy..."
-          NODE_CRITICAL=0
-          NODE_HIGH=0
-          NODE_MEDIUM=0
-          NODE_LOW=0
-          PYTHON_CRITICAL=0
-          PYTHON_HIGH=0
-          PYTHON_MEDIUM=0
-          PYTHON_LOW=0
+          scan_sbom() {
+            local input=$1 output=$2
+            [ -f "$input" ] && [ -s "$input" ] && [ "$(jq -r '.components | length' "$input" 2>/dev/null || echo 0)" != "0" ] && \
+            trivy sbom --format json --output "$output" "$input" 2>/dev/null || echo '{"Results":[]}' > "$output"
+          }
           
-          if [ -f "sbom-nodejs.json" ] && [ -s "sbom-nodejs.json" ] && [ "$(jq -r '.components | length' sbom-nodejs.json 2>/dev/null || echo 0)" != "0" ]; then
-            trivy sbom --format json --output trivy-nodejs.json sbom-nodejs.json
-            NODE_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
-            NODE_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
-            NODE_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
-            NODE_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-nodejs.json 2>/dev/null || echo "0")
-          fi
+          scan_sbom sbom-nodejs.json trivy-nodejs.json
+          scan_sbom sbom-python.json trivy-python.json
           
-          if [ -f "sbom-python.json" ] && [ -s "sbom-python.json" ] && [ "$(jq -r '.components | length' sbom-python.json 2>/dev/null || echo 0)" != "0" ]; then
-            trivy sbom --format json --output trivy-python.json sbom-python.json
-            PYTHON_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-python.json 2>/dev/null || echo "0")
-            PYTHON_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-python.json 2>/dev/null || echo "0")
-            PYTHON_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-python.json 2>/dev/null || echo "0")
-            PYTHON_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-python.json 2>/dev/null || echo "0")
-          fi
+          count_vulns() {
+            local file=$1 severity=$2
+            jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$severity\")] | length" "$file" 2>/dev/null || echo 0
+          }
           
-          TRIVY_CRITICAL=$((NODE_CRITICAL + PYTHON_CRITICAL))
-          TRIVY_HIGH=$((NODE_HIGH + PYTHON_HIGH))
-          TRIVY_MEDIUM=$((NODE_MEDIUM + PYTHON_MEDIUM))
-          TRIVY_LOW=$((NODE_LOW + PYTHON_LOW))
-          TRIVY_TOTAL=$((TRIVY_CRITICAL + TRIVY_HIGH + TRIVY_MEDIUM + TRIVY_LOW))
+          CRITICAL=$(($(count_vulns trivy-nodejs.json CRITICAL) + $(count_vulns trivy-python.json CRITICAL)))
+          HIGH=$(($(count_vulns trivy-nodejs.json HIGH) + $(count_vulns trivy-python.json HIGH)))
+          MEDIUM=$(($(count_vulns trivy-nodejs.json MEDIUM) + $(count_vulns trivy-python.json MEDIUM)))
+          LOW=$(($(count_vulns trivy-nodejs.json LOW) + $(count_vulns trivy-python.json LOW)))
+          TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))
           
-          echo "trivy_critical=$TRIVY_CRITICAL" >> $GITHUB_OUTPUT
-          echo "trivy_high=$TRIVY_HIGH" >> $GITHUB_OUTPUT
-          echo "trivy_medium=$TRIVY_MEDIUM" >> $GITHUB_OUTPUT
-          echo "trivy_low=$TRIVY_LOW" >> $GITHUB_OUTPUT
-          echo "trivy_total=$TRIVY_TOTAL" >> $GITHUB_OUTPUT
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH" >> $GITHUB_OUTPUT
+          echo "medium=$MEDIUM" >> $GITHUB_OUTPUT
+          echo "low=$LOW" >> $GITHUB_OUTPUT
+          echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
       - name: Get Dependency-Track metrics
-        id: dt_metrics
+        id: dt
         run: |
-          echo "Waiting for Dependency-Track analysis..."
           sleep 30
-          
-          PROJECT_UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
+          UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
             -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" | jq -r '.uuid')
           
-          # Wait for analysis to complete
           for i in {1..15}; do
-            METRICS=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/metrics/project/$PROJECT_UUID/current" \
+            METRICS=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/metrics/project/$UUID/current" \
               -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}")
-            LAST_OCCURRENCE=$(echo $METRICS | jq -r '.lastOccurrence // empty')
-            if [ -n "$LAST_OCCURRENCE" ] && [ "$LAST_OCCURRENCE" != "null" ]; then
-              break
-            fi
-            echo "Waiting for analysis... ($i/15)"
-            sleep 10
+            [ -n "$(echo $METRICS | jq -r '.lastOccurrence // empty' 2>/dev/null)" ] && break
+            [ $i -lt 15 ] && sleep 10
           done
           
-          DT_CRITICAL=$(echo $METRICS | jq -r '.critical // 0')
-          DT_HIGH=$(echo $METRICS | jq -r '.high // 0')
-          DT_MEDIUM=$(echo $METRICS | jq -r '.medium // 0')
-          DT_LOW=$(echo $METRICS | jq -r '.low // 0')
-          DT_TOTAL=$(echo $METRICS | jq -r '.vulnerabilities // 0')
-          
-          echo "dt_critical=$DT_CRITICAL" >> $GITHUB_OUTPUT
-          echo "dt_high=$DT_HIGH" >> $GITHUB_OUTPUT
-          echo "dt_medium=$DT_MEDIUM" >> $GITHUB_OUTPUT
-          echo "dt_low=$DT_LOW" >> $GITHUB_OUTPUT
-          echo "dt_total=$DT_TOTAL" >> $GITHUB_OUTPUT
+          echo "critical=$(echo $METRICS | jq -r '.critical // 0')" >> $GITHUB_OUTPUT
+          echo "high=$(echo $METRICS | jq -r '.high // 0')" >> $GITHUB_OUTPUT
+          echo "medium=$(echo $METRICS | jq -r '.medium // 0')" >> $GITHUB_OUTPUT
+          echo "low=$(echo $METRICS | jq -r '.low // 0')" >> $GITHUB_OUTPUT
+          echo "total=$(echo $METRICS | jq -r '.vulnerabilities // 0')" >> $GITHUB_OUTPUT
 
-      - name: Display Comparison Report
+      - name: Display results
         run: |
-          echo ""
-          echo "=========================================="
-          echo "📊 VULNERABILITY SCAN COMPARISON"
-          echo "=========================================="
-          echo ""
-          echo "Project: ${{ env.PROJECT_NAME }}"
-          echo "Version: ${{ env.PROJECT_VERSION }}"
-          echo ""
-          echo "┌─────────────────┬──────────────┬──────────────┐"
-          echo "│ Severity        │ Dependency-Track │ Trivy      │"
-          echo "├─────────────────┼──────────────┼──────────────┤"
-          printf "│ 🔴 Critical     │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_critical }}" "${{ steps.trivy_scan.outputs.trivy_critical }}"
-          printf "│ 🟠 High          │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_high }}" "${{ steps.trivy_scan.outputs.trivy_high }}"
-          printf "│ 🟡 Medium        │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_medium }}" "${{ steps.trivy_scan.outputs.trivy_medium }}"
-          printf "│ 🟢 Low           │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_low }}" "${{ steps.trivy_scan.outputs.trivy_low }}"
-          echo "├─────────────────┼──────────────┼──────────────┤"
-          printf "│ 📈 Total         │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_total }}" "${{ steps.trivy_scan.outputs.trivy_total }}"
-          echo "└─────────────────┴──────────────┴──────────────┘"
-          echo ""
-          echo "=========================================="
+          printf "\n==========================================\n"
+          printf "📊 VULNERABILITY SCAN COMPARISON\n"
+          printf "==========================================\n\n"
+          printf "Project: ${{ env.PROJECT_NAME }}\n"
+          printf "Version: ${{ env.PROJECT_VERSION }}\n\n"
+          printf "┌──────────────┬──────────────────┬──────────┐\n"
+          printf "│ Severity     │ Dependency-Track │ Trivy    │\n"
+          printf "├──────────────┼──────────────────┼──────────┤\n"
+          printf "│ 🔴 Critical  │ %16s │ %8s │\n" "${{ steps.dt.outputs.critical }}" "${{ steps.trivy.outputs.critical }}"
+          printf "│ 🟠 High       │ %16s │ %8s │\n" "${{ steps.dt.outputs.high }}" "${{ steps.trivy.outputs.high }}"
+          printf "│ 🟡 Medium     │ %16s │ %8s │\n" "${{ steps.dt.outputs.medium }}" "${{ steps.trivy.outputs.medium }}"
+          printf "│ 🟢 Low        │ %16s │ %8s │\n" "${{ steps.dt.outputs.low }}" "${{ steps.trivy.outputs.low }}"
+          printf "├──────────────┼──────────────────┼──────────┤\n"
+          printf "│ 📈 Total      │ %16s │ %8s │\n" "${{ steps.dt.outputs.total }}" "${{ steps.trivy.outputs.total }}"
+          printf "└──────────────┴──────────────────┴──────────┘\n"
+          printf "==========================================\n"
