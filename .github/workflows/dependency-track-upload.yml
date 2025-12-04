@@ -59,18 +59,19 @@ jobs:
         id: upload
         run: |
           PROJECT_VERSION=$(date +%Y%m%d)
+          PROJECT_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
           
           if [ ! -s sbom.json ]; then
             echo "SBOM missing or empty"
             exit 1
           fi
 
-          echo "Uploading SBOM with projectName=${{ env.PROJECT_NAME }}, version=$PROJECT_VERSION"
+          echo "Uploading SBOM with projectName=$PROJECT_NAME, version=$PROJECT_VERSION"
           
           RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
             -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
             -X POST "${{ env.DT_URL }}/api/v1/bom" \
-            -F "projectName=${{ env.PROJECT_NAME }}" \
+            -F "projectName=$PROJECT_NAME" \
             -F "projectVersion=$PROJECT_VERSION" \
             -F "bom=@sbom.json" \
             -F "autoCreate=true")
@@ -89,7 +90,7 @@ jobs:
           # Get project UUID for metrics
           sleep 2
           PROJECT_UUID=$(curl -s -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-            "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=$PROJECT_VERSION" | jq -r '.uuid // empty')
+            "${{ env.DT_URL }}/api/v1/project/lookup?name=$PROJECT_NAME&version=$PROJECT_VERSION" | jq -r '.uuid // empty')
           
           if [ -z "$PROJECT_UUID" ]; then
             echo "⚠️  Could not get project UUID, but upload succeeded"
