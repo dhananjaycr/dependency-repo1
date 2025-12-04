@@ -13,83 +13,36 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Setup environment
+      - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y jq curl git wget apt-transport-https gnupg lsb-release python3 python3-pip
-          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-          sudo apt-get install -y nodejs
-          npm install -g @cyclonedx/cyclonedx-npm
-          python3 -m pip install cyclonedx-bom
+          sudo apt-get install -y jq curl git wget apt-transport-https gnupg lsb-release
           wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
           echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
           sudo apt-get update && sudo apt-get install -y trivy
 
-      - name: Checkout code
+      - name: Checkout repository
         run: |
           git clone --depth 1 --branch ${{ github.ref_name }} https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git .
 
-      - name: Install dependencies
+      - name: Generate SBOM with Trivy
         run: |
-          if [ -f "app/package.json" ]; then
-            cd app && npm install --no-audit --no-fund --package-lock-only && cd ..
-          elif [ -f "package.json" ]; then
-            npm install --no-audit --no-fund --package-lock-only
-          fi
+          trivy fs --format cyclonedx --output sbom.json .
 
-      - name: Generate SBOMs
-        run: |
-          if [ -f "app/package.json" ]; then
-            cd app && cyclonedx-npm --output-file ../sbom-nodejs.json && cd ..
-          elif [ -f "package.json" ]; then
-            cyclonedx-npm --output-file sbom-nodejs.json
-          else
-            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-nodejs.json
-          fi
-          
-          if [ -f "requirements.txt" ]; then
-            cyclonedx-bom -o sbom-python.json -r requirements.txt
-          else
-            echo '{"bomFormat":"CycloneDX","specVersion":"1.4","version":1,"components":[]}' > sbom-python.json
-          fi
-
-      - name: Upload SBOMs
-        run: |
-          upload_sbom() {
-            local file=$1
-            [ -f "$file" ] && [ -s "$file" ] && [ "$(jq -r '.components | length' "$file" 2>/dev/null || echo 0)" != "0" ] && \
-            curl -s -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
-              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
-              -H "Content-Type: multipart/form-data" \
-              -F "projectName=${{ env.PROJECT_NAME }}" \
-              -F "projectVersion=${{ env.PROJECT_VERSION }}" \
-              -F "bom=@$file" \
-              -F "autoCreate=true" > /dev/null && echo "✅ Uploaded $(basename $file)" || echo "⚠️  Skipped $(basename $file)"
-          }
-          upload_sbom sbom-nodejs.json
-          upload_sbom sbom-python.json
-
-      - name: Scan with Trivy
+      - name: Scan vulnerabilities with Trivy
         id: trivy
         run: |
-          scan_sbom() {
-            local input=$1 output=$2
-            [ -f "$input" ] && [ -s "$input" ] && [ "$(jq -r '.components | length' "$input" 2>/dev/null || echo 0)" != "0" ] && \
-            trivy sbom --format json --output "$output" "$input" 2>/dev/null || echo '{"Results":[]}' > "$output"
-          }
-          
-          scan_sbom sbom-nodejs.json trivy-nodejs.json
-          scan_sbom sbom-python.json trivy-python.json
+          trivy fs --format json --severity CRITICAL,HIGH,MEDIUM,LOW . > vulns.json
           
           count_vulns() {
-            local file=$1 severity=$2
-            jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$severity\")] | length" "$file" 2>/dev/null || echo 0
+            local severity=$1
+            jq "[.Results[]?.Vulnerabilities[]? | select(.Severity==\"$severity\")] | length" vulns.json 2>/dev/null || echo 0
           }
           
-          CRITICAL=$(($(count_vulns trivy-nodejs.json CRITICAL) + $(count_vulns trivy-python.json CRITICAL)))
-          HIGH=$(($(count_vulns trivy-nodejs.json HIGH) + $(count_vulns trivy-python.json HIGH)))
-          MEDIUM=$(($(count_vulns trivy-nodejs.json MEDIUM) + $(count_vulns trivy-python.json MEDIUM)))
-          LOW=$(($(count_vulns trivy-nodejs.json LOW) + $(count_vulns trivy-python.json LOW)))
+          CRITICAL=$(count_vulns CRITICAL)
+          HIGH=$(count_vulns HIGH)
+          MEDIUM=$(count_vulns MEDIUM)
+          LOW=$(count_vulns LOW)
           TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))
           
           echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
@@ -98,15 +51,39 @@ jobs:
           echo "low=$LOW" >> $GITHUB_OUTPUT
           echo "total=$TOTAL" >> $GITHUB_OUTPUT
 
+      - name: Create Dependency-Track project
+        id: create_project
+        run: |
+          PROJECT_UUID=$(curl -s -X PUT "${{ env.DT_URL }}/api/v1/project" \
+            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"${{ env.PROJECT_NAME }}\",\"version\":\"${{ env.PROJECT_VERSION }}\"}" | jq -r '.uuid // empty')
+          
+          if [ -z "$PROJECT_UUID" ]; then
+            PROJECT_UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
+              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" | jq -r '.uuid')
+          fi
+          
+          echo "uuid=$PROJECT_UUID" >> $GITHUB_OUTPUT
+          echo "Project UUID: $PROJECT_UUID"
+
+      - name: Upload SBOM to Dependency-Track
+        run: |
+          if [ -f "sbom.json" ] && [ -s "sbom.json" ]; then
+            curl -s -X POST "${{ env.DT_URL }}/api/v1/bom" \
+              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+              -F "project=${{ steps.create_project.outputs.uuid }}" \
+              -F "bom=@sbom.json" && echo "✅ Uploaded SBOM successfully"
+          else
+            echo "⚠️  No SBOM generated"
+          fi
+
       - name: Get Dependency-Track metrics
         id: dt
         run: |
           sleep 30
-          UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
-            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" | jq -r '.uuid')
-          
           for i in {1..15}; do
-            METRICS=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/metrics/project/$UUID/current" \
+            METRICS=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/metrics/project/${{ steps.create_project.outputs.uuid }}/current" \
               -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}")
             [ -n "$(echo $METRICS | jq -r '.lastOccurrence // empty' 2>/dev/null)" ] && break
             [ $i -lt 15 ] && sleep 10
