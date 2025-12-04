@@ -1,0 +1,154 @@
+name: Generate and Upload SBOM to Dependency-Track
+
+on:
+  workflow_dispatch:
+
+env:
+  DT_URL: https://dependabot.coinroutes.com:8081
+  PROJECT_NAME: clarity-test
+  PROJECT_VERSION: ${{ github.run_number }}
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CycloneDX tools
+        run: |
+          npm install -g @cyclonedx/cyclonedx-npm
+          pip install cyclonedx-bom
+
+      - name: Generate SBOMs
+        run: |
+          cd app && cyclonedx-npm --output-file ../sbom-nodejs.json
+          cd .. && cyclonedx-bom -o sbom-python.json -r requirements.txt
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+
+      - name: Upload SBOMs to Dependency-Track
+        run: |
+          curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
+            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            -H "Content-Type: multipart/form-data" \
+            -F "projectName=${{ env.PROJECT_NAME }}" \
+            -F "projectVersion=${{ env.PROJECT_VERSION }}" \
+            -F "bom=@sbom-nodejs.json" \
+            -F "autoCreate=true"
+          
+          curl -X "PUT" "${{ env.DT_URL }}/api/v1/bom" \
+            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" \
+            -H "Content-Type: multipart/form-data" \
+            -F "projectName=${{ env.PROJECT_NAME }}" \
+            -F "projectVersion=${{ env.PROJECT_VERSION }}" \
+            -F "bom=@sbom-python.json" \
+            -F "autoCreate=true"
+
+      - name: Scan SBOMs with Trivy
+        id: trivy_scan
+        run: |
+          echo "Scanning SBOMs with Trivy..."
+          trivy sbom --format json --output trivy-nodejs.json sbom-nodejs.json
+          trivy sbom --format json --output trivy-python.json sbom-python.json
+          
+          # Parse Trivy results
+          NODE_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-nodejs.json || echo "0")
+          NODE_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-nodejs.json || echo "0")
+          NODE_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-nodejs.json || echo "0")
+          NODE_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-nodejs.json || echo "0")
+          
+          PYTHON_CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-python.json || echo "0")
+          PYTHON_HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-python.json || echo "0")
+          PYTHON_MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' trivy-python.json || echo "0")
+          PYTHON_LOW=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="LOW")] | length' trivy-python.json || echo "0")
+          
+          TRIVY_CRITICAL=$((NODE_CRITICAL + PYTHON_CRITICAL))
+          TRIVY_HIGH=$((NODE_HIGH + PYTHON_HIGH))
+          TRIVY_MEDIUM=$((NODE_MEDIUM + PYTHON_MEDIUM))
+          TRIVY_LOW=$((NODE_LOW + PYTHON_LOW))
+          TRIVY_TOTAL=$((TRIVY_CRITICAL + TRIVY_HIGH + TRIVY_MEDIUM + TRIVY_LOW))
+          
+          echo "trivy_critical=$TRIVY_CRITICAL" >> $GITHUB_OUTPUT
+          echo "trivy_high=$TRIVY_HIGH" >> $GITHUB_OUTPUT
+          echo "trivy_medium=$TRIVY_MEDIUM" >> $GITHUB_OUTPUT
+          echo "trivy_low=$TRIVY_LOW" >> $GITHUB_OUTPUT
+          echo "trivy_total=$TRIVY_TOTAL" >> $GITHUB_OUTPUT
+
+      - name: Get Dependency-Track metrics
+        id: dt_metrics
+        run: |
+          echo "Waiting for Dependency-Track analysis..."
+          sleep 30
+          
+          PROJECT_UUID=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/project/lookup?name=${{ env.PROJECT_NAME }}&version=${{ env.PROJECT_VERSION }}" \
+            -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}" | jq -r '.uuid')
+          
+          # Wait for analysis to complete
+          for i in {1..15}; do
+            METRICS=$(curl -s -X "GET" "${{ env.DT_URL }}/api/v1/metrics/project/$PROJECT_UUID/current" \
+              -H "X-Api-Key: ${{ secrets.DEPENDENCY_TRACK_API_KEY }}")
+            LAST_OCCURRENCE=$(echo $METRICS | jq -r '.lastOccurrence // empty')
+            if [ -n "$LAST_OCCURRENCE" ] && [ "$LAST_OCCURRENCE" != "null" ]; then
+              break
+            fi
+            echo "Waiting for analysis... ($i/15)"
+            sleep 10
+          done
+          
+          DT_CRITICAL=$(echo $METRICS | jq -r '.critical // 0')
+          DT_HIGH=$(echo $METRICS | jq -r '.high // 0')
+          DT_MEDIUM=$(echo $METRICS | jq -r '.medium // 0')
+          DT_LOW=$(echo $METRICS | jq -r '.low // 0')
+          DT_TOTAL=$(echo $METRICS | jq -r '.vulnerabilities // 0')
+          
+          echo "dt_critical=$DT_CRITICAL" >> $GITHUB_OUTPUT
+          echo "dt_high=$DT_HIGH" >> $GITHUB_OUTPUT
+          echo "dt_medium=$DT_MEDIUM" >> $GITHUB_OUTPUT
+          echo "dt_low=$DT_LOW" >> $GITHUB_OUTPUT
+          echo "dt_total=$DT_TOTAL" >> $GITHUB_OUTPUT
+
+      - name: Display Comparison Report
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 VULNERABILITY SCAN COMPARISON"
+          echo "=========================================="
+          echo ""
+          echo "Project: ${{ env.PROJECT_NAME }}"
+          echo "Version: ${{ env.PROJECT_VERSION }}"
+          echo ""
+          echo "┌─────────────────┬──────────────┬──────────────┐"
+          echo "│ Severity        │ Dependency-Track │ Trivy      │"
+          echo "├─────────────────┼──────────────┼──────────────┤"
+          printf "│ 🔴 Critical     │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_critical }}" "${{ steps.trivy_scan.outputs.trivy_critical }}"
+          printf "│ 🟠 High          │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_high }}" "${{ steps.trivy_scan.outputs.trivy_high }}"
+          printf "│ 🟡 Medium        │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_medium }}" "${{ steps.trivy_scan.outputs.trivy_medium }}"
+          printf "│ 🟢 Low           │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_low }}" "${{ steps.trivy_scan.outputs.trivy_low }}"
+          echo "├─────────────────┼──────────────┼──────────────┤"
+          printf "│ 📈 Total         │ %12s │ %12s │\n" "${{ steps.dt_metrics.outputs.dt_total }}" "${{ steps.trivy_scan.outputs.trivy_total }}"
+          echo "└─────────────────┴──────────────┴──────────────┘"
+          echo ""
+          echo "=========================================="
