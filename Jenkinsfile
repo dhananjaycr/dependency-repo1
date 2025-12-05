@@ -146,13 +146,19 @@ pipeline {
                         METRICS=\$(curl -s -X GET "${DT_SERVER_URL}/api/v1/metrics/project/\$PROJECT_UUID/current" \\
                           -H "X-Api-Key: ${DT_API_KEY}")
                         
-                        echo "\$METRICS" | jq '.' > ${WORKSPACE}/vulnerability_metrics.json
+                        # Validate and sanitize JSON response
+                        if [ -z "\$METRICS" ] || ! echo "\$METRICS" | jq . >/dev/null 2>&1; then
+                            echo "⚠️  Warning: Invalid or empty metrics response, using defaults"
+                            METRICS='{"critical":0,"high":0,"medium":0,"low":0,"vulnerabilities":0}'
+                        fi
                         
-                        CRITICAL=\$(echo "\$METRICS" | jq -r '.critical // 0')
-                        HIGH=\$(echo "\$METRICS" | jq -r '.high // 0')
-                        MEDIUM=\$(echo "\$METRICS" | jq -r '.medium // 0')
-                        LOW=\$(echo "\$METRICS" | jq -r '.low // 0')
-                        TOTAL=\$(echo "\$METRICS" | jq -r '.vulnerabilities // 0')
+                        echo "\$METRICS" | jq '.' > ${WORKSPACE}/vulnerability_metrics.json 2>/dev/null || echo '{"critical":0,"high":0,"medium":0,"low":0,"vulnerabilities":0}' > ${WORKSPACE}/vulnerability_metrics.json
+                        
+                        CRITICAL=\$(echo "\$METRICS" | jq -r '.critical // 0' 2>/dev/null || echo "0")
+                        HIGH=\$(echo "\$METRICS" | jq -r '.high // 0' 2>/dev/null || echo "0")
+                        MEDIUM=\$(echo "\$METRICS" | jq -r '.medium // 0' 2>/dev/null || echo "0")
+                        LOW=\$(echo "\$METRICS" | jq -r '.low // 0' 2>/dev/null || echo "0")
+                        TOTAL=\$(echo "\$METRICS" | jq -r '.vulnerabilities // 0' 2>/dev/null || echo "0")
                         
                         echo ""
                         echo "=========================================="
@@ -177,7 +183,12 @@ pipeline {
                         FINDINGS=\$(curl -s -X GET "${DT_SERVER_URL}/api/v1/finding/project/\$PROJECT_UUID?suppressed=false" \\
                           -H "X-Api-Key: ${DT_API_KEY}")
                         
-                        echo "\$FINDINGS" | jq '[.[] | .vulnerability.severity] | group_by(.) | map({severity: .[0], count: length})' > ${WORKSPACE}/findings_summary.json
+                        # Validate findings JSON before parsing
+                        if [ -z "\$FINDINGS" ] || ! echo "\$FINDINGS" | jq . >/dev/null 2>&1; then
+                            echo '[]' > ${WORKSPACE}/findings_summary.json
+                        else
+                            echo "\$FINDINGS" | jq '[.[] | .vulnerability.severity] | group_by(.) | map({severity: .[0], count: length})' > ${WORKSPACE}/findings_summary.json 2>/dev/null || echo '[]' > ${WORKSPACE}/findings_summary.json
+                        fi
                         
                         # Generate simple HTML report
                         cat > ${WORKSPACE}/dependency-track-report.html <<EOF
