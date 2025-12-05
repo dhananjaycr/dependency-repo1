@@ -235,7 +235,11 @@ EOF
                 }
             }
         }
-        
+        stage('DP check') {
+            steps {
+                dependencyCheck additionalArguments: '--format HTML', odcInstallation: 'dependency-check'
+            }
+        }
         stage('Cleanup') {
             steps {
                 script {
