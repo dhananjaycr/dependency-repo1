@@ -277,23 +277,18 @@ EOF
         }
         success {
             script {
-                try {
-                    def metrics = readJSON file: "${WORKSPACE}/vulnerability_metrics.json"
-                    def projectUuid = sh(script: "cat ${WORKSPACE}/project_uuid.txt 2>/dev/null || echo ''", returnStdout: true).trim()
-                    
+                sh """
                     echo ""
                     echo "=========================================="
                     echo "✅ PIPELINE COMPLETED SUCCESSFULLY"
                     echo "=========================================="
                     echo "Project: ${PROJECT_NAME} v${VERSION}"
-                    echo "Critical: ${metrics.critical ?: 0} | High: ${metrics.high ?: 0} | Total: ${metrics.vulnerabilities ?: 0}"
-                    if (projectUuid) {
-                        echo "View Report: ${DT_SERVER_URL}/projects/${projectUuid}"
-                    }
+                    if [ -f ${WORKSPACE}/project_uuid.txt ]; then
+                        PROJECT_UUID=\$(cat ${WORKSPACE}/project_uuid.txt)
+                        echo "View Report: ${DT_SERVER_URL}/projects/\$PROJECT_UUID"
+                    fi
                     echo "=========================================="
-                } catch (Exception e) {
-                    echo "✅ Pipeline completed successfully!"
-                }
+                """
             }
         }
         failure {
